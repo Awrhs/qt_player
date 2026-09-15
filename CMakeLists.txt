@@ -8,7 +8,7 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC OFF)
 
 # ── Dependencies ──────────────────────────────────────────────────────────
-find_package(Qt6 REQUIRED COMPONENTS Widgets Multimedia)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Multimedia Network)
 
 # FFmpeg via pkg-config (MSYS2, Linux) or manual path
 find_package(PkgConfig QUIET)
@@ -58,7 +58,7 @@ file(GLOB_RECURSE CORE_SOURCES
 add_library(qt_player_core STATIC ${CORE_SOURCES})
 target_include_directories(qt_player_core PUBLIC src)
 target_include_directories(qt_player_core PRIVATE ${FFMPEG_INCLUDE_DIRS})
-target_link_libraries(qt_player_core PUBLIC Qt6::Core)
+target_link_libraries(qt_player_core PUBLIC Qt6::Core Qt6::Gui Qt6::Multimedia Qt6::Network)
 target_link_libraries(qt_player_core PRIVATE ${FFMPEG_LIBRARIES})
 
 # ── UI library ────────────────────────────────────────────────────────────

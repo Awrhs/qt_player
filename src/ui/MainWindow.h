@@ -6,7 +6,8 @@
 #include <QTimer>
 #include <memory>
 
-class PlayerController;
+#include "core/PlayerController.h" // PlayState 定义
+
 class VideoWidget;
 class PlaybackControls;
 class SpectrumWidget;

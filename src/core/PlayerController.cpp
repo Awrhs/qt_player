@@ -76,8 +76,6 @@ void PlayerController::open(const QString& path, bool useHardwareDecode) {
                 return;
             }
         }
-            return;
-        }
         if (!videoRenderer_->open(codecpar->width, codecpar->height,
                                   (AVPixelFormat)codecpar->format)) {
             emit errorOccurred(QStringLiteral("无法初始化视频渲染器"));

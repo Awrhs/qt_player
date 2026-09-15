@@ -18,7 +18,8 @@ extern "C" {
 #include "BoundedQueue.h"
 
 class AudioClock;
-class Equalizer; // forward declaration
+class Equalizer;       // forward declaration
+class SpectrumAnalyzer; // forward declaration
 
 /**
  * @brief 音频输出模块

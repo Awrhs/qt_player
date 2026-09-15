@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QThread>
 #include <QUrl>
+#include <QTimer>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <atomic>

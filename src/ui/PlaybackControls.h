@@ -9,6 +9,8 @@
 #include <QVBoxLayout>
 #include <vector>
 
+#include "ClickableSlider.h"
+
 /**
  * @brief 播放控制栏（底部）
  *
@@ -43,14 +45,16 @@ private slots:
 
 private:
     QPushButton* btnPlayPause_;
-    QSlider*     slider_;
+    ClickableSlider* slider_;
     QLabel*      labelTime_;
     QPushButton* btnStepBack_;
     QPushButton* btnStepFwd_;
     QPushButton* btnSpeed_;
-    QSlider*     volumeSlider_;
+    ClickableSlider* volumeSlider_;
     QPushButton* btnMute_;
     bool         seeking_ = false;
+    double       duration_ = 0.0;          // 视频总时长（秒）
+    double       pendingSeekPos_ = -1.0;   // 已发出但尚未生效的 seek 位置
 
     // 倍速预设
     std::vector<double> speedPresets_ = {0.5, 0.75, 1.0, 1.25, 1.5, 2.0};

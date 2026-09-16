@@ -58,6 +58,9 @@ public:
     /** @brief 设置基准时间 */
     void set(double pts);
 
+    /** @brief 设置播放速度 */
+    void setSpeed(double speed);
+
     /** @brief 暂停时停止时钟递增 */
     void pause();
 
@@ -70,6 +73,7 @@ public:
 private:
     std::chrono::steady_clock::time_point baseTime_;
     double basePts_ = 0.0;
+    double speed_ = 1.0;
     bool paused_ = false;
 };
 

@@ -1,6 +1,8 @@
 #ifndef DECODER_H
 #define DECODER_H
 
+#include <mutex>
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -64,6 +66,8 @@ private:
     AVBufferRef*     hwDeviceCtx_ = nullptr;   // DXVA2 device
     AVPixelFormat    hwPixFmt_    = AV_PIX_FMT_NONE;
     bool             useHW_       = false;
+
+    mutable std::mutex mtx_;  // 保护 sendPacket/receiveFrame/flush/close 的并发访问
 
     /**
      * @brief 尝试创建 DXVA2 硬件设备并配置解码器

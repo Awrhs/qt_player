@@ -18,6 +18,13 @@ extern "C" {
  *  - 探测流信息（音视频流索引、时长、time_base）
  *  - 循环读取 AVPacket
  */
+/** @brief 单次 packet 读取结果（区分 EOF 与读错误） */
+enum class ReadStatus {
+    Ok,    ///< 成功，pkt 输出堆分配的 AVPacket（调用方 av_packet_free）
+    Eof,   ///< 已到达文件末尾（seek 后可再次读取）
+    Error  ///< 读取发生错误
+};
+
 class Demuxer {
 public:
     Demuxer();
@@ -36,10 +43,10 @@ public:
 
     /**
      * @brief 读取下一个 AVPacket
-     * @return 堆分配的 AVPacket（调用方需 av_packet_unref + delete），
-     *         EOF 或出错时返回 nullptr
+     * @param pkt[out] Ok 时输出堆分配的 AVPacket（调用方负责 av_packet_free）
+     * @return Ok / Eof / Error；Eof/Error 时 pkt 保持为 nullptr
      */
-    AVPacket* read();
+    ReadStatus readPacket(AVPacket*& pkt);
 
     /** @brief 关闭并释放资源 */
     void close();

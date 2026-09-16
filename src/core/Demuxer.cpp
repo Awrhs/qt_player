@@ -45,18 +45,25 @@ bool Demuxer::open(const std::string& url) {
     return true;
 }
 
-AVPacket* Demuxer::read() {
-    if (!fmtCtx_) return nullptr;
+ReadStatus Demuxer::readPacket(AVPacket*& pkt) {
+    pkt = nullptr;
+    if (!fmtCtx_) return ReadStatus::Error;
 
-    AVPacket* pkt = av_packet_alloc();
-    if (!pkt) return nullptr;
+    pkt = av_packet_alloc();
+    if (!pkt) return ReadStatus::Error;
 
     int ret = av_read_frame(fmtCtx_, pkt);
     if (ret < 0) {
         av_packet_free(&pkt);
-        return nullptr; // EOF or error
+        if (ret == AVERROR_EOF) {
+            return ReadStatus::Eof;
+        }
+        char errBuf[256] = {0};
+        av_strerror(ret, errBuf, sizeof(errBuf));
+        LOG_W("av_read_frame error: %s", errBuf);
+        return ReadStatus::Error;
     }
-    return pkt;
+    return ReadStatus::Ok;
 }
 
 void Demuxer::close() {

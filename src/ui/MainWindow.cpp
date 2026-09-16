@@ -4,6 +4,9 @@
 #include "SpectrumWidget.h"
 #include "EqualizerPanel.h"
 #include "../core/PlayerController.h"
+#include "../utils/Log.h"
+
+LOG_TAG("MainWindow")
 
 #include <QMenuBar>
 #include <QMenu>
@@ -14,6 +17,7 @@
 #include <QSplitter>
 #include <QStatusBar>
 #include <QApplication>
+#include <QCloseEvent>
 #include <QFileInfo>
 
 MainWindow::MainWindow(QWidget* parent)
@@ -39,10 +43,24 @@ MainWindow::MainWindow(QWidget* parent)
     connect(controller_, &PlayerController::errorOccurred,
             this, &MainWindow::onError);
     connect(controller_, &PlayerController::durationChanged,
-            this, [this](double) {});
+            this, [this](double d) { controls_->setDuration(d); });
+    connect(controller_, &PlayerController::playbackFinished,
+            this, &MainWindow::onPlaybackFinished);
+    connect(controller_, &PlayerController::displayAspectChanged,
+            videoWidget_, &VideoWidget::setDisplayAspect);
 }
 
 MainWindow::~MainWindow() = default;
+
+void MainWindow::closeEvent(QCloseEvent* event) {
+    LOG_I("closeEvent: shutting down player before close");
+    if (controller_) {
+        // 必须同步关闭：停音频设备 + join 工作线程，不能只投递异步 stop 命令
+        controller_->shutdown();
+    }
+    event->accept();
+    // 此处不主动调 qApp->quit()：Qt 默认行为（WA_QuitOnClose）会处理
+}
 
 void MainWindow::openFile() {
     QString path = QFileDialog::getOpenFileName(
@@ -56,6 +74,14 @@ void MainWindow::openFile() {
 void MainWindow::openPath(const QString& path) {
     statusBar()->showMessage(tr("正在打开: %1...").arg(QFileInfo(path).fileName()));
     controller_->open(path);
+    // 渲染器随 open 重建为原始尺寸；优先用源尺寸 × 当前窗口提前配置目标，
+    // 使首帧即按显示尺寸输出（同时也覆盖同尺寸重开不去重的情况）
+    int vw = controller_->videoWidth();
+    int vh = controller_->videoHeight();
+    if (vw > 0 && vh > 0) {
+        QSize target = QSize(vw, vh).scaled(videoWidget_->size(), Qt::KeepAspectRatio);
+        controller_->setVideoTargetSize(target.width(), target.height());
+    }
 }
 
 void MainWindow::onPlayPause() {
@@ -67,6 +93,7 @@ void MainWindow::onPlayPause() {
 }
 
 void MainWindow::onSeek(double position) {
+    LOG_I("onSeek: %.3f", position);
     controller_->seek(position);
 }
 
@@ -75,11 +102,11 @@ void MainWindow::onSpeedChanged(double factor) {
 }
 
 void MainWindow::onVolumeChanged(int percent) {
-    Q_UNUSED(percent)
+    controller_->setVolume(percent);
 }
 
 void MainWindow::onMuteToggled(bool muted) {
-    Q_UNUSED(muted)
+    controller_->setMuted(muted);
 }
 
 void MainWindow::onStateChanged(PlayState state) {
@@ -129,6 +156,15 @@ void MainWindow::onPositionUpdate() {
     if (controller_) {
         controls_->updatePosition(controller_->position(), controller_->duration());
     }
+}
+
+void MainWindow::onPlaybackFinished() {
+    // 自然播放结束：进度与时间标签吸附到总时长，状态栏提示
+    if (controller_) {
+        double dur = controller_->duration();
+        controls_->updatePosition(dur, dur);
+    }
+    statusBar()->showMessage(tr("播放结束"));
 }
 
 void MainWindow::setupMenuBar() {
@@ -211,4 +247,8 @@ void MainWindow::setupUI() {
             this, &MainWindow::onVolumeChanged);
     connect(controls_, &PlaybackControls::muteToggled,
             this, &MainWindow::onMuteToggled);
+
+    // 视频输出尺寸跟随窗口内容区（sws 直接缩放到显示尺寸）
+    connect(videoWidget_, &VideoWidget::contentResolutionChanged,
+            controller_, &PlayerController::setVideoTargetSize);
 }

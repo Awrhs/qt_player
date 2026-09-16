@@ -33,6 +33,10 @@ private slots:
     void onFrameReady(const QImage& image);
     void onError(const QString& msg);
     void onPositionUpdate();
+    void onPlaybackFinished();
+
+protected:
+    void closeEvent(QCloseEvent* event) override;
 
 private:
     void setupMenuBar();

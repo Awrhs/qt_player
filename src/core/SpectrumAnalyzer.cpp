@@ -1,112 +1,142 @@
 #include "SpectrumAnalyzer.h"
-#include "../utils/Log.h"
 
 #include <cmath>
 #include <algorithm>
 #include <cstring>
 
-LOG_TAG("Spectrum")
-
-SpectrumAnalyzer::SpectrumAnalyzer()
-    : bands_(NUM_BANDS, 0.0f)
-{
+SpectrumAnalyzer::SpectrumAnalyzer() {
     buffer_.reserve(FFT_SIZE);
+    real_.resize(FFT_SIZE);
+    imag_.resize(FFT_SIZE);
+    window_.resize(FFT_SIZE);
+    rebuildLayout();
+}
+
+void SpectrumAnalyzer::setSampleRate(int sampleRate) {
+    if (sampleRate <= 0) return;
+    if (sampleRate == sampleRate_) return;
+    sampleRate_ = sampleRate;
+    rebuildLayout();
 }
 
 void SpectrumAnalyzer::feed(const float* data, size_t samples) {
     for (size_t i = 0; i < samples; ++i) {
-        buffer_.push_back(data[i]);
-        if (buffer_.size() >= FFT_SIZE) {
-            processNow();
-            buffer_.clear();
-        }
+        pushMono(data[i]);
     }
 }
 
-std::vector<float> SpectrumAnalyzer::processNow() {
-    // 确保有足够数据
-    size_t n = std::min(buffer_.size(), static_cast<size_t>(FFT_SIZE));
-    if (n < 4) return bands_;
+void SpectrumAnalyzer::feedInterleaved(const float* data, size_t frames, int channels) {
+    if (channels <= 0) return;
+    if (channels == 1) {
+        feed(data, frames);
+        return;
+    }
+    for (size_t i = 0; i < frames; ++i) {
+        float sum = 0.0f;
+        for (int c = 0; c < channels; ++c) {
+            sum += data[i * channels + c];
+        }
+        pushMono(sum / channels);
+    }
+}
 
-    // 准备 FFT 输入（padding 到 FFT_SIZE）
-    std::vector<double> real(FFT_SIZE, 0.0);
-    std::vector<double> imag(FFT_SIZE, 0.0);
+void SpectrumAnalyzer::pushMono(float sample) {
+    buffer_.push_back(sample);
+    if (buffer_.size() >= FFT_SIZE) {
+        processNow();
+        buffer_.clear();
+    }
+}
 
-    for (size_t i = 0; i < n; ++i) {
-        real[i] = static_cast<double>(buffer_[i]);
+std::vector<float> SpectrumAnalyzer::bands() const {
+    std::lock_guard<std::mutex> lock(bandsMtx_);
+    return std::vector<float>(bands_.begin(), bands_.end());
+}
+
+void SpectrumAnalyzer::reset() {
+    buffer_.clear();
+    std::lock_guard<std::mutex> lock(bandsMtx_);
+    bands_.fill(0.0f);
+}
+
+void SpectrumAnalyzer::rebuildLayout() {
+    // Hann 窗表（只算一次）
+    for (int i = 0; i < FFT_SIZE; ++i) {
+        window_[i] = static_cast<float>(
+            0.5 * (1.0 - std::cos(2.0 * M_PI * i / (FFT_SIZE - 1))));
     }
 
-    // Hann 窗
-    applyHannWindow(real, FFT_SIZE);
-
-    // FFT
-    fft(real, imag, FFT_SIZE);
-
-    // 幅度谱（取前 N/2 个 bin）
-    std::vector<double> magnitude(FFT_SIZE / 2, 0.0);
-    for (int i = 0; i < FFT_SIZE / 2; ++i) {
-        magnitude[i] = std::sqrt(real[i] * real[i] + imag[i] * imag[i]);
+    // 对数频段边界：20Hz ~ min(16kHz, 奈奎斯特的 90%)
+    const double fStart = 20.0;
+    const double fEnd   = std::min(16000.0, sampleRate_ * 0.5 * 0.9);
+    std::array<double, NUM_BANDS + 1> edges{};
+    for (int b = 0; b <= NUM_BANDS; ++b) {
+        double t = static_cast<double>(b) / NUM_BANDS;
+        edges[b] = fStart * std::pow(fEnd / fStart, t);
     }
 
-    // 对数分档：24 段
-    // 频段范围：约 20Hz ~ 8000Hz（16kHz 采样率下 FFT 可到 8kHz）
-    static const double bandFreqs[NUM_BANDS + 1] = {
-        20, 33, 56, 94, 159, 268, 451, 761, 1280, 2154,
-        3627, 6108, 8000  // +1 作为上边界
-    };
-
-    // 调整实际使用的段数（8000Hz 以上我们截断）
-    const int usableBands = NUM_BANDS;
-    std::vector<double> bandEnergy(usableBands, 0.0);
-    std::vector<int> bandCount(usableBands, 0);
-
-    int halfFft = FFT_SIZE / 2;
-    for (int bin = 1; bin < halfFft; ++bin) {
-        double freq = static_cast<double>(bin) * SAMPLE_RATE / FFT_SIZE;
-        // 找到所属频段
-        for (int b = 0; b < usableBands; ++b) {
-            if (freq >= bandFreqs[b] && freq < bandFreqs[b + 1]) {
-                bandEnergy[b] += magnitude[bin];
-                bandCount[b]++;
+    // 预构 bin→band 映射，processNow 不再做 O(N×bands) 查找
+    binBand_.fill(-1);
+    for (int bin = 1; bin < HALF_FFT; ++bin) {
+        double freq = static_cast<double>(bin) * sampleRate_ / FFT_SIZE;
+        for (int b = 0; b < NUM_BANDS; ++b) {
+            if (freq >= edges[b] && freq < edges[b+1]) {
+                binBand_[bin] = b;
                 break;
             }
         }
     }
+}
 
-    // 平均 + dB 归一化到 [0, 1]
-    double maxEnergy = 1e-6;
-    for (int b = 0; b < usableBands; ++b) {
+void SpectrumAnalyzer::processNow() {
+    const size_t n = std::min(buffer_.size(), static_cast<size_t>(FFT_SIZE));
+    if (n < 4) return;
+
+    // 零填充到 FFT_SIZE（复用成员缓冲）
+    std::fill(real_.begin(), real_.end(), 0.0f);
+    std::fill(imag_.begin(), imag_.end(), 0.0f);
+    for (size_t i = 0; i < n; ++i) {
+        real_[i] = buffer_[i] * window_[i];
+    }
+
+    fft(real_.data(), imag_.data(), FFT_SIZE);
+
+    // 按预构 LUT 累加各频段幅度
+    std::array<float, NUM_BANDS> bandEnergy{};
+    std::array<int,   NUM_BANDS> bandCount{};
+    for (int bin = 1; bin < HALF_FFT; ++bin) {
+        int b = binBand_[bin];
+        if (b < 0) continue;
+        float re = real_[bin], im = imag_[bin];
+        bandEnergy[b] += std::sqrt(re * re + im * im);
+        bandCount[b]++;
+    }
+
+    // 平均 + dB 归一化到 [0,1]，再做自动增益（保持原有显示特性）
+    std::array<float, NUM_BANDS> result{};
+    float maxEnergy = 1e-6f;
+    for (int b = 0; b < NUM_BANDS; ++b) {
+        float v = 0.0f;
         if (bandCount[b] > 0) {
-            bandEnergy[b] /= bandCount[b];
+            v = bandEnergy[b] / bandCount[b];
         }
-        // dB 转换
-        bands_[b] = static_cast<float>(20.0 * std::log10(bandEnergy[b] + 1e-6));
-        bands_[b] = std::max(0.0f, bands_[b]); // 0dB 以上视为 1（实际罕见）
-        // 归一化到 [0,1]
-        bands_[b] = std::min(1.0f, bands_[b] / 60.0f);
-        if (bands_[b] < 0) bands_[b] = 0;
-        maxEnergy = std::max(maxEnergy, static_cast<double>(bands_[b]));
+        v = static_cast<float>(20.0 * std::log10(v + 1e-6));
+        v = std::max(0.0f, v);
+        v = std::min(1.0f, v / 60.0f);
+        result[b] = v;
+        maxEnergy = std::max(maxEnergy, v);
     }
-
-    // 自动增益：确保有峰值
-    if (maxEnergy > 0) {
-        // 平滑
-        for (int b = 0; b < usableBands; ++b) {
-            bands_[b] = static_cast<float>(bands_[b] / maxEnergy);
+    if (maxEnergy > 0.0f) {
+        for (int b = 0; b < NUM_BANDS; ++b) {
+            result[b] /= maxEnergy;
         }
     }
 
-    return bands_;
+    std::lock_guard<std::mutex> lock(bandsMtx_);
+    bands_ = result;
 }
 
-void SpectrumAnalyzer::applyHannWindow(std::vector<double>& buffer, int n) {
-    for (int i = 0; i < n; ++i) {
-        double w = 0.5 * (1.0 - std::cos(2.0 * M_PI * i / (n - 1)));
-        buffer[i] *= w;
-    }
-}
-
-void SpectrumAnalyzer::fft(std::vector<double>& real, std::vector<double>& imag, int n) {
+void SpectrumAnalyzer::fft(float* real, float* imag, int n) {
     // 位反转重排
     for (int i = 1, j = 0; i < n; ++i) {
         int bit = n >> 1;
@@ -122,34 +152,28 @@ void SpectrumAnalyzer::fft(std::vector<double>& real, std::vector<double>& imag,
 
     // 蝶形运算
     for (int len = 2; len <= n; len <<= 1) {
-        double angle = -2.0 * M_PI / len;
-        double wReal = std::cos(angle);
-        double wImag = std::sin(angle);
+        float angle = static_cast<float>(-2.0 * M_PI / len);
+        float wReal = std::cos(angle);
+        float wImag = std::sin(angle);
 
         for (int i = 0; i < n; i += len) {
-            double uReal = 1.0, uImag = 0.0;
+            float uReal = 1.0f, uImag = 0.0f;
             for (int j = 0; j < len / 2; ++j) {
                 int even = i + j;
                 int odd  = i + j + len / 2;
 
-                // t = w * a[odd]
-                double tReal = uReal * real[odd] - uImag * imag[odd];
-                double tImag = uReal * imag[odd] + uImag * real[odd];
+                float tReal = uReal * real[odd] - uImag * imag[odd];
+                float tImag = uReal * imag[odd] + uImag * real[odd];
 
                 real[odd] = real[even] - tReal;
                 imag[odd] = imag[even] - tImag;
                 real[even] += tReal;
                 imag[even] += tImag;
 
-                // 旋转因子递进
-                double tmp = uReal * wReal - uImag * wImag;
+                float tmp = uReal * wReal - uImag * wImag;
                 uImag = uReal * wImag + uImag * wReal;
                 uReal = tmp;
             }
         }
     }
-}
-
-int SpectrumAnalyzer::freqToBin(double freq, int fftSize, int sampleRate) const {
-    return static_cast<int>(freq * fftSize / sampleRate);
 }

@@ -9,6 +9,7 @@ Decoder::Decoder()  = default;
 Decoder::~Decoder() { close(); }
 
 bool Decoder::open(const AVCodecParameters* codecpar, bool useHW) {
+    std::lock_guard<std::mutex> lock(mtx_);
     close();
     useHW_ = useHW;
 
@@ -62,11 +63,13 @@ bool Decoder::open(const AVCodecParameters* codecpar, bool useHW) {
 }
 
 int Decoder::sendPacket(AVPacket* pkt) {
+    std::lock_guard<std::mutex> lock(mtx_);
     if (!ctx_) return AVERROR(EINVAL);
     return avcodec_send_packet(ctx_, pkt);
 }
 
 int Decoder::receiveFrame(AVFrame* frame) {
+    std::lock_guard<std::mutex> lock(mtx_);
     if (!ctx_) return AVERROR(EINVAL);
     int ret = avcodec_receive_frame(ctx_, frame);
 
@@ -94,6 +97,7 @@ int Decoder::receiveFrame(AVFrame* frame) {
 }
 
 void Decoder::flush() {
+    std::lock_guard<std::mutex> lock(mtx_);
     if (ctx_) avcodec_flush_buffers(ctx_);
 }
 

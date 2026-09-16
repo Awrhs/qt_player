@@ -10,7 +10,8 @@
 - ✓ 进度条拖动 seek（响应 ≤ 200ms）
 - ✓ 倍速播放 0.5x ~ 2.0x
 - ✓ 逐帧前进/后退（暂停态可用）
-- ✓ 音量调节 0~100% + 静音
+- ✓ 自然播放结束进入暂停态（末帧保留、按钮切换状态）
+- ✓ 音量调节 0~100% + 静音（点击式音量滑块，支持点击定位与拖动）
 
 ### 音视频同步
 - ✓ 音频主时钟同步（误差 ≤ 80ms）
@@ -113,18 +114,22 @@ cmake --build build
 ```
 ┌─ 主线程（Qt UI）───────────────┐
 │ MainWindow / 渲染定时器 (15ms)    │
+│  └─ checkPlaybackFinished()     │
 │ SpectrumWidget (33ms)           │
 └──────────┬──────────────────────┘
            │ 命令队列
 ┌──────────▼──────────────────────┐
 │ DemuxThread                     │
 │   av_read_frame → 音频包/视频包  │
+│   EOF → nullptr 哨兵投递         │
 ├─────────────────────────────────┤
 │ AudioDecodeThread               │
 │   解码 → swr_convert → EQ → PCM │
+│   nullptr 哨兵 → drain → flush  │
 ├─────────────────────────────────┤
 │ VideoDecodeThread               │
 │   解码（软/硬）→ 帧队列           │
+│   nullptr 哨兵 → drain           │
 └─────────────────────────────────┘
 ```
 
@@ -133,9 +138,10 @@ cmake --build build
 ```
 文件/URL → AVIOContext → av_read_frame → AVPacket → PacketQueue
 → AVCodecContext → AVFrame → FrameQueue
-音频 → swr_convert → Equalizer(10 biquad) → PCM RingBuffer → QAudioSink
-                      └→ SpectrumAnalyzer(FFT 2048 → 24 bands)
+音频 → swr_convert → Equalizer(10 biquad, 采样率跟随变速) → PCM RingBuffer → QAudioSink
+                      └→ SpectrumAnalyzer(FFT 2048 → 24 bands, 采样率跟随变速)
 视频 → AudioClock sync → sws_scale(YUV→RGBA) → QImage → paintEvent
+EOF → demux nullptr哨兵 → decoder drain → swr flushTail/empty → 250ms稳态 → pause
 ```
 
 ### 关键类
@@ -145,13 +151,14 @@ cmake --build build
 | PlayerController | 状态机 + 线程管理 + 命令队列 |
 | Demuxer | AVFormatContext 封装 |
 | Decoder | 软/硬解码器封装 |
-| VideoRenderer | sws_scale → QImage |
-| AudioOutput | 重采样 + QAudioSink 输出 |
-| AudioClock | 基于样本消耗的音频时钟 |
-| Equalizer | 10 段 RBJ IIR 级联 |
+| VideoRenderer | sws_scale → QImage，对齐 stride 防 SIMD 越界 |
+| AudioOutput | 重采样 + QAudioSink 输出 + 变速（swr 变输出率） |
+| AudioClock | 基于样本消耗的音频主时钟 + EOF 稳态 |
+| Equalizer | 10 段 RBJ IIR 级联，原子切换无爆音 |
 | SpectrumAnalyzer | 自实现 FFT + 24 段对数分档 |
 | BoundedQueue | 线程安全有界阻塞队列 |
 | RingBuffer | 线程安全环形缓冲 |
+| ClickableSlider | 支持点击定位的自定义滑块 |
 | ResumeManager | QSettings 断点持久化 |
 
 ## 项目结构
@@ -176,6 +183,7 @@ qt_player/
 │   │   ├── NetPrefetcher.h/cpp
 │   │   └── CustomAVIO.h/cpp
 │   ├── ui/             # 用户界面
+│   │   ├── ClickableSlider.h
 │   │   ├── MainWindow.h/cpp
 │   │   ├── VideoWidget.h/cpp
 │   │   ├── SpectrumWidget.h/cpp
@@ -202,6 +210,7 @@ qt_player/
 | 渲染方式 | QWidget + QImage | 实现简单 |
 | 同步策略 | 音频主时钟 | 人耳最敏感；ffplay 标准 |
 | 硬解路线 | DXVA2 回读模式 | 编码简单；v2 可升级 D3D9 互操作 |
+| EOF 策略 | nullptr 哨兵 drain + 250ms 稳态 | 覆盖 PulseAudio ~80ms 设备缓冲，不截尾音 |
 
 ## 许可
 
@@ -222,3 +231,7 @@ FFmpeg 是 LGPG/GPL 许可的第三方库。Qt 是 LGPL 许可的第三方库。
 | 10 段均衡器 | Equalizer | FR-06 |
 | 多线程分离架构 | 线程模型 | §5.2 |
 | 滑动窗口缓存 / 断点续播 | RingBuffer / ResumeManager | FR-07 |
+
+## 效果图
+
+![alt text](image.png)

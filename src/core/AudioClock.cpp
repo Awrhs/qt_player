@@ -1,5 +1,7 @@
 #include "AudioClock.h"
 
+#include <algorithm>
+
 // ── AudioClock ───────────────────────────────────────────────────────────
 
 double AudioClock::now() const {
@@ -35,12 +37,26 @@ double ExternalClock::now() const {
     if (paused_) return basePts_;
     auto elapsed = std::chrono::steady_clock::now() - baseTime_;
     double sec = std::chrono::duration<double>(elapsed).count();
-    return basePts_ + sec;
+    return basePts_ + sec * speed_;
 }
 
 void ExternalClock::set(double pts) {
     basePts_ = pts;
     baseTime_ = std::chrono::steady_clock::now();
+}
+
+void ExternalClock::setSpeed(double speed) {
+    speed = std::clamp(speed, 0.5, 2.0);
+    if (paused_) {
+        speed_ = speed;
+        return;
+    }
+    // 保持连续性：将当前时间折算到新基准
+    auto now = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(now - baseTime_).count();
+    basePts_ = basePts_ + elapsed * speed_;
+    baseTime_ = now;
+    speed_ = speed;
 }
 
 void ExternalClock::pause() {

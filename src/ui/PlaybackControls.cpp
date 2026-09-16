@@ -1,4 +1,9 @@
 #include "PlaybackControls.h"
+#include "../utils/Log.h"
+
+#include <cmath>
+
+LOG_TAG("Controls")
 
 PlaybackControls::PlaybackControls(QWidget* parent)
     : QWidget(parent)
@@ -8,27 +13,27 @@ PlaybackControls::PlaybackControls(QWidget* parent)
     layout->setSpacing(6);
 
     // ── 播放/暂停 ──
-    btnPlayPause_ = new QPushButton(QStringLiteral("▶"), this);
+    btnPlayPause_ = new QPushButton(QStringLiteral(">"), this);
     btnPlayPause_->setFixedSize(32, 32);
     btnPlayPause_->setToolTip(tr("播放/暂停 (Space)"));
     connect(btnPlayPause_, &QPushButton::clicked, this, &PlaybackControls::playPauseClicked);
 
     // ── 逐帧后退 ──
-    btnStepBack_ = new QPushButton(QStringLiteral("⏪"), this);
-    btnStepBack_->setFixedSize(28, 28);
+    btnStepBack_ = new QPushButton(QStringLiteral("|<"), this);
+    btnStepBack_->setFixedSize(32, 32);
     btnStepBack_->setToolTip(tr("逐帧后退"));
     btnStepBack_->setEnabled(false);
     connect(btnStepBack_, &QPushButton::clicked, this, &PlaybackControls::stepBackwardClicked);
 
     // ── 逐帧前进 ──
-    btnStepFwd_ = new QPushButton(QStringLiteral("⏩"), this);
-    btnStepFwd_->setFixedSize(28, 28);
+    btnStepFwd_ = new QPushButton(QStringLiteral(">|"), this);
+    btnStepFwd_->setFixedSize(32, 32);
     btnStepFwd_->setToolTip(tr("逐帧前进"));
     btnStepFwd_->setEnabled(false);
     connect(btnStepFwd_, &QPushButton::clicked, this, &PlaybackControls::stepForwardClicked);
 
     // ── 进度条 ──
-    slider_ = new QSlider(Qt::Horizontal, this);
+    slider_ = new ClickableSlider(Qt::Horizontal, this);
     slider_->setRange(0, 1000);
     slider_->setValue(0);
     connect(slider_, &QSlider::sliderPressed,  this, &PlaybackControls::onSliderPressed);
@@ -48,13 +53,17 @@ PlaybackControls::PlaybackControls(QWidget* parent)
     connect(btnSpeed_, &QPushButton::clicked, this, &PlaybackControls::onSpeedCycle);
 
     // ── 音量 ──
-    btnMute_ = new QPushButton(QStringLiteral("🔊"), this);
-    btnMute_->setFixedSize(28, 28);
+    btnMute_ = new QPushButton(QStringLiteral("Vol"), this);
+    btnMute_->setFixedSize(32, 32);
     btnMute_->setToolTip(tr("静音"));
     btnMute_->setCheckable(true);
     connect(btnMute_, &QPushButton::toggled, this, &PlaybackControls::muteToggled);
+    // 静音状态切换文本
+    connect(btnMute_, &QPushButton::toggled, this, [this](bool muted) {
+        btnMute_->setText(muted ? QStringLiteral("Mute") : QStringLiteral("Vol"));
+    });
 
-    volumeSlider_ = new QSlider(Qt::Horizontal, this);
+    volumeSlider_ = new ClickableSlider(Qt::Horizontal, this);
     volumeSlider_->setRange(0, 100);
     volumeSlider_->setValue(100);
     volumeSlider_->setFixedWidth(80);
@@ -72,7 +81,15 @@ PlaybackControls::PlaybackControls(QWidget* parent)
 }
 
 void PlaybackControls::updatePosition(double current, double duration) {
+    if (duration > 0) duration_ = duration;   // 同步时长，供 onSliderReleased 换算
+
     if (seeking_) return;
+
+    // seek 已发出但时钟尚未跳到目标位置前，不要用旧时钟值把滑块拉回
+    if (pendingSeekPos_ >= 0.0 && std::fabs(current - pendingSeekPos_) > 0.5) {
+        return;
+    }
+    pendingSeekPos_ = -1.0;   // 时钟已追上目标，恢复跟随
 
     if (duration > 0) {
         slider_->setValue(static_cast<int>(current / duration * 1000));
@@ -92,11 +109,11 @@ void PlaybackControls::updatePosition(double current, double duration) {
 }
 
 void PlaybackControls::setPlaying(bool playing) {
-    btnPlayPause_->setText(playing ? QStringLiteral("⏸") : QStringLiteral("▶"));
+    btnPlayPause_->setText(playing ? QStringLiteral("||") : QStringLiteral(">"));
 }
 
-void PlaybackControls::setDuration(double /*seconds*/) {
-    // 目前不需要额外处理
+void PlaybackControls::setDuration(double seconds) {
+    duration_ = seconds;
 }
 
 void PlaybackControls::setSpeedText(const QString& text) {
@@ -110,12 +127,22 @@ void PlaybackControls::setStepEnabled(bool enabled) {
 
 void PlaybackControls::onSliderPressed() {
     seeking_ = true;
+    LOG_I("onSliderPressed");
 }
 
 void PlaybackControls::onSliderReleased() {
     seeking_ = false;
-    double pos = slider_->value() / 1000.0;
-    emit seekRequested(pos);
+    // 滑块值 0~1000 是全时长的千分比，换算成秒
+    double fraction = slider_->value() / 1000.0;
+    double pos = fraction * duration_;
+    pendingSeekPos_ = pos;
+    LOG_I("onSliderReleased: slider=%d (%.1f%%), pos=%.3fs, duration=%.2fs",
+          slider_->value(), fraction * 100.0, pos, duration_);
+    if (duration_ > 0) {
+        emit seekRequested(pos);
+    } else {
+        LOG_W("onSliderReleased: duration unknown, seek ignored");
+    }
 }
 
 void PlaybackControls::onSliderMoved(int value) {

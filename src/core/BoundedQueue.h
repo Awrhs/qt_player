@@ -38,6 +38,14 @@ public:
     }
 
     /**
+     * @brief 左值重载：拷贝一份后按右值入队
+     */
+    bool push(const T& item, std::chrono::milliseconds timeout = std::chrono::milliseconds(3000)) {
+        T copy(item);
+        return push(std::move(copy), timeout);
+    }
+
+    /**
      * @brief 尝试弹出元素，队列空时等待直到超时
      * @param item 输出引用，接收弹出的元素
      * @param timeout 最大等待时间，超时返回 false

@@ -333,7 +333,12 @@ size_t AudioOutput::pullAudio(float* out, size_t frames) {
         // 时钟 = 已交付数据末尾 − 设备缓冲延迟（折算为媒体时间），且不早于本段起点
         double pos = r.endPos - latencySec_ * r.tempo;
         if (haveFloor_.load()) pos = std::max(pos, floorPos_.load());
-        if (clock_) clock_->update(pos, r.tempo);
+        if (clock_) {
+            clock_->update(pos, r.tempo);
+            // 本次只拿到部分数据、其余补了静音：时钟停在真实数据末尾，
+            // 静音填充期间不走时（下一块数据到达即恢复）
+            if (r.frames < frames && !eos_.load()) clock_->freeze();
+        }
     } else if (clock_) {
         if (eos_.load()) {
             // 尾音播完后继续走时，让位置到达末尾 / 更长的视频继续播放

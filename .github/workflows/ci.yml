@@ -35,7 +35,7 @@ jobs:
       - name: Test
         env:
           QT_QPA_PLATFORM: offscreen
-        run: ctest --test-dir build --output-on-failure --timeout 400
+        run: ctest --test-dir build --output-on-failure --verbose --timeout 400
 
       - name: Upload binary
         if: success()
@@ -72,10 +72,10 @@ jobs:
           # Qt / FFmpeg 全局单例在进程退出时的泄漏不是本项目的问题
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        run: ctest --test-dir build --output-on-failure --timeout 600
+        run: ctest --test-dir build --output-on-failure --verbose --timeout 600
 
   windows-msys2:
-    name: Windows (MSYS2 MinGW64)
+    name: Windows (MSYS2 UCRT64)
     runs-on: windows-latest
     defaults:
       run:
@@ -85,16 +85,16 @@ jobs:
 
       - uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-qt6-base
-            mingw-w64-x86_64-qt6-multimedia
-            mingw-w64-x86_64-ffmpeg
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-qt6-base
+            mingw-w64-ucrt-x86_64-qt6-multimedia
+            mingw-w64-ucrt-x86_64-ffmpeg
 
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
@@ -105,12 +105,12 @@ jobs:
       - name: Test
         env:
           QT_QPA_PLATFORM: offscreen
-        run: ctest --test-dir build --output-on-failure --timeout 400
+        run: ctest --test-dir build --output-on-failure --verbose --timeout 400
 
       - name: Upload binary
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: qt_player-windows-mingw64
+          name: qt_player-windows-ucrt64
           path: build/qt_player.exe
           retention-days: 7

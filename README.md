@@ -76,12 +76,13 @@
 | Qt | ≥ 6.4（Widgets + Multimedia） |
 | FFmpeg | ≥ 5.1（libavformat / libavcodec / libavutil / libswresample / libswscale / **libavfilter**） |
 
-### Windows (MSYS2 MINGW64)
+### Windows (MSYS2 UCRT64 / MINGW64)
 
 ```bash
-pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja \
-          mingw-w64-x86_64-pkgconf mingw-w64-x86_64-qt6-base \
-          mingw-w64-x86_64-qt6-multimedia mingw-w64-x86_64-ffmpeg
+# UCRT64 环境（推荐；MINGW64 环境把前缀换成 mingw-w64-x86_64- 即可）
+pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja \
+          mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-qt6-base \
+          mingw-w64-ucrt-x86_64-qt6-multimedia mingw-w64-ucrt-x86_64-ffmpeg
 
 cd qt_player
 cmake -B build -G Ninja

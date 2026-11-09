@@ -3,7 +3,8 @@ project(qt_player VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+# M_PI 等数学常量在 MSVC / 严格模式 MinGW 下需要显式开启
+add_compile_definitions(_USE_MATH_DEFINES)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC OFF)
@@ -63,7 +64,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     endif()
 elseif(MSVC)
     target_compile_options(qt_player_flags INTERFACE /W3 /utf-8)
-    target_compile_definitions(qt_player_flags INTERFACE _USE_MATH_DEFINES NOMINMAX)
+    target_compile_definitions(qt_player_flags INTERFACE NOMINMAX)
 endif()
 
 # ── Core static library (no Qt Widgets dependency) ───────────────────────

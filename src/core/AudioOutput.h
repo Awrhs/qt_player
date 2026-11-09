@@ -3,34 +3,41 @@
 
 #include <QObject>
 #include <QIODevice>
+#include <QAudioFormat>
 #include <QAudioSink>
-#include <QByteArray>
-#include <QPointer>
+#include <QTimer>
 #include <memory>
 #include <vector>
 #include <atomic>
 #include <mutex>
+#include <chrono>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
-#include <libavutil/avutil.h>
-#include <libswresample/swresample.h>
+#include <libavutil/channel_layout.h>
 }
 
-#include "BoundedQueue.h"
+#include "AudioPipeline.h"
+#include "PcmQueue.h"
 
-class AudioClock;
-class Equalizer;       // forward declaration
-class SpectrumAnalyzer; // forward declaration
+class MediaClock;
+class Equalizer;
+class SpectrumAnalyzer;
 
 /**
- * @brief 音频输出模块
+ * @brief 音频输出
  *
- * 使用 QAudioSink 输出音频，包含：
- *  - swr_convert：源格式 → FLT / 立体声（采样率与源一致直通，由音频
- *    服务端决定是否重采样，避免 48k→44.1k→48k 双重重采样）
- *  - PCM 环形缓冲：解码线程填充，QAudioSink 消费
- *  - 欠载补齐：缓冲瞬时不足时短等待，仍不足则填静音并返回完整请求
+ * 数据流：解码线程 pushFrame → AudioPipeline（格式转换 + 变速）→ EQ/频谱 →
+ *        PcmQueue（约 250ms 有界，背压）→ 设备回调 pullAudio → QAudioSink
+ *
+ *  - 主时钟：每次向设备交付 PCM 后，用该 PCM 携带的媒体时间锚定 MediaClock，
+ *    并扣除设备缓冲延迟（QAudioSink::bufferSize），seek/变速后时钟自动跟随真实播放位置。
+ *  - 无可用音频设备（无声卡、CI、设备被占用）时自动退化为“空设备”：由定时器按
+ *    实时速率消费 PCM 并驱动时钟，视频照常播放。
+ *  - 代际 serial：flush(serial) 之后，旧代际的帧一律丢弃，杜绝 seek 后听到旧位置声音。
+ *
+ * 线程约束：open/close/start/pause/resume/setVolume/setMuted 仅主线程；
+ *          pushFrame/pushEndOfStream 仅解码线程；flush/setSpeed 任意线程。
  */
 class AudioOutput : public QObject {
     Q_OBJECT
@@ -39,130 +46,71 @@ public:
     ~AudioOutput() override;
 
     /**
-     * @brief 初始化音频输出
-     * @param sampleRate       源采样率（输出采样率与源一致）
-     * @param srcLayout        源声道布局（nullptr 时按立体声默认处理）
-     * @param srcFmt           源采样格式（如 AAC 解码输出 FLTP）
-     * @param audioClock       关联的音频时钟
-     * @return 成功返回 true
+     * @brief 打开（选择设备采样率、配置管线），不启动设备
+     * @param timeBase 音频流 time_base（解码帧 pts 的单位）
      */
-    bool init(int sampleRate, const AVChannelLayout* srcLayout,
-              AVSampleFormat srcFmt, AudioClock* audioClock);
+    bool open(int srcSampleRate, const AVChannelLayout* srcLayout, AVSampleFormat srcFmt,
+              AVRational timeBase, MediaClock* clock);
 
-    /** @brief 启动音频输出 */
-    void start();
+    /** @brief 关闭并释放（调用方须保证生产线程已退出） */
+    void close();
 
-    /**
-     * @brief 停止音频输出并释放全部资源（调用方须保证生产线程已停止或不并发）
-     */
-    void stop();
-
-    /**
-     * @brief 关闭流程第一步（主线程）：停设备回调、推进 PCM 代际以唤醒任何
-     *        阻塞在 writeFrames 的生产者，但保留 swr/QAudioSink 对象。
-     *        之后调用方 join 生产线程，再调 finishShutdown() 释放资源。
-     */
-    void beginShutdown();
-
-    /** @brief 关闭流程第二步：生产线程 join 后释放 swr/设备等资源 */
-    void finishShutdown();
-
-    /** @brief 暂停音频输出 */
+    /** @brief 启动设备（失败则退化为空设备）；幂等 */
+    bool start();
     void pause();
-
-    /** @brief 恢复音频输出 */
     void resume();
 
-    /**
-     * @brief 写入 PCM 数据（解码线程调用）
-     * @param data    float 格式 PCM 数据（通道交错）
-     * @param frames  帧数（每帧 channels 个样本）
-     */
-    void writeFrames(const float* data, size_t frames);
+    /** @brief 关闭流程第一步（任意线程）：唤醒阻塞在入队上的生产者 */
+    void requestStop();
 
-    /**
-     * @brief 写入解码后的 AVFrame（自动重采样）
-     * @param frame 解码后的音频帧
-     * @return 成功返回 true
-     */
-    bool writeFrame(AVFrame* frame);
+    /** @brief 生产者的停止令牌：为 false 时入队等待立即返回 */
+    void setStopToken(const std::atomic<bool>* running) { running_ = running; }
 
-    /**
-     * @brief 排空重采样器内部延迟样本（EOF drain 后由解码线程调用）
-     *
-     * swr 重采样内部缓存少量样本，正常 swr_convert 不会输出，
-     * 必须以 NULL 输入再调一次才能取出，否则结尾会丢失几十毫秒声音。
-     */
-    void flushTail();
+    // ── 生产者（解码线程） ──
+    void pushFrame(const AVFrame* frame, uint64_t serial);
+    void pushEndOfStream(uint64_t serial);
 
-    /**
-     * @brief 重置重采样管线（seek 后调用，清空 swr 内部延迟）
-     */
-    void resetPipeline();
-
-    /** 清空缓冲（seek 时调用） */
-    void clear();
-
-    /** @brief PCM 队列与余量是否都已空（播放结束判定用） */
-    bool isBufferEmpty() const;
-
-    /** @brief PCM 队列代际（解码线程据此感知 seek/stop 清空） */
-    uint64_t queueGeneration() const { return queueGeneration_.load(); }
-
-    /** @brief 设置均衡器（可选） */
-    void setEqualizer(Equalizer* eq) { equalizer_ = eq; }
-
-    /** @brief 设置频谱分析器（可选） */
-    void setSpectrumAnalyzer(SpectrumAnalyzer* sa) { spectrumAnalyzer_ = sa; }
-
-    /** @brief 是否已初始化 */
-    bool isInitialized() const { return initialized_.load(); }
-
-    /** @brief 获取已消耗的样本数 */
-    int64_t consumedSamples() const { return consumedSamples_.load(); }
-
-    /** @brief 输出参数 */
-    int outputSampleRate()  const { return outputSampleRate_; }
-    int outputChannels()    const { return outputChannels_; }
-
-    /**
-     * @brief 设置音量（UI 线程调用）
-     * @param percent 0 ~ 100
-     */
+    // ── 控制 ──
+    /** @brief seek：切换代际、丢弃全部缓冲、设置 pre-roll 丢弃阈值（流时间，秒） */
+    void flush(uint64_t serial, double discardUntilSec);
+    void setSpeed(double speed);
     void setVolume(int percent);
-
-    /**
-     * @brief 静音开关（UI 线程调用）
-     * @param muted true 静音
-     */
     void setMuted(bool muted);
-
-    /** @brief 当前音量 */
-    int  volume() const { return volumePercent_.load(); }
+    int  volume() const { return volume_.load(); }
     bool muted()  const { return muted_.load(); }
 
+    // ── 状态 ──
+    bool isOpen()        const { return opened_.load(); }
+    bool isStarted()     const { return started_.load(); }
+    bool usingNullSink() const { return nullSink_.load(); }
+    /** @brief 已收到 EOF 且全部 PCM 已交付设备 */
+    bool isDrained() const;
+    bool endOfStream() const { return eos_.load(); }
+    int  sampleRate() const { return outRate_; }
+    int  channels()   const { return AudioPipeline::kOutChannels; }
+    double latencySeconds() const { return latencySec_; }
+    uint64_t currentSerial() const;
+    size_t queuedFrames() const { return queue_.queuedFrames(); }
+    int underrunCount() const { return underrunCount_.load(); }
+
+    void setEqualizer(Equalizer* eq) { equalizer_ = eq; }
+    void setSpectrumAnalyzer(SpectrumAnalyzer* sa) { spectrumAnalyzer_ = sa; }
+
     /**
-     * @brief 设置播放速度（通过改变输出采样率实现，变调不变速）
-     * @param speed 0.5 ~ 2.0
+     * @brief 消费端：拉取 frames 帧交错 float（不足补静音）并推进主时钟
      *
-     * 原理：保持源解码器输出不变，改变 swr 输出采样率 = 源采样率 × speed。
-     * 输出采样率变化 → QAudioSink 以新速率播放 → 等效变速。
-     * 代价：每次速度变更需销毁并重建音频设备，会产生极短暂的停顿。
+     * 由设备回调 / 空设备定时器调用；测试可直接调用以模拟设备。
      */
-    void setPlaybackSpeed(double speed);
+    size_t pullAudio(float* out, size_t frames);
+
+    // ── 测试钩子 ──
+    void setForceNullSink(bool force) { forceNull_ = force; }
+    void setLatencyOverride(double sec) { latencyOverride_ = sec; if (sec >= 0.0) latencySec_ = sec; }
 
 signals:
-    void underrun(); // 缓冲不足
+    void underrun();
 
 private:
-    /** @brief 将音量/静音状态应用到音频设备 */
-    void applyVolume();
-
-    /**
-     * @brief 内部 QIODevice 实现
-     *
-     * QAudioSink 通过 readData 回调拉取数据。
-     */
     class AudioIO : public QIODevice {
     public:
         explicit AudioIO(AudioOutput* output);
@@ -172,67 +120,47 @@ private:
     private:
         AudioOutput* output_;
     };
-
     friend class AudioIO;
 
-    // 内部 PCM 缓冲
-    BoundedQueue<std::vector<float>> pcmQueue_{60};
+    void applyVolume();
+    void nullTick();
+    void queueChunks(std::vector<PcmChunk>& chunks, uint64_t gen);
 
-    // readData 未消费完的 PCM 余量（设备回调线程读写，clear 时其他线程清）。
-    // 用起始偏移消费，避免 vector 头部 erase 的 O(N) memmove。
-    mutable std::mutex leftoverMutex_;
-    std::vector<float> leftover_;
-    size_t             leftoverOffset_ = 0;
+    mutable std::mutex pipeMtx_;
+    AudioPipeline  pipeline_;
+    uint64_t       serial_ = 0;
+    PcmQueue       queue_;
+    MediaClock*    clock_ = nullptr;
+    const std::atomic<bool>* running_ = nullptr;
 
-    // 重采样
-    SwrContext* swrCtx_ = nullptr;
-    int outputSampleRate_  = 48000;
-    int outputChannels_    = 2;
+    QAudioFormat                format_;
+    std::unique_ptr<QAudioSink> sink_;
+    AudioIO*                    io_ = nullptr;
+    QTimer*                     nullTimer_ = nullptr;
+    std::chrono::steady_clock::time_point nullLast_{};
+    std::vector<float>          nullScratch_;
 
-    // swr 输出缓冲（仅音频解码线程访问，容量只增不减，避免每帧分配）
-    std::vector<float> swrBuf_;
+    int    outRate_         = 48000;
+    double latencySec_      = 0.0;
+    double latencyOverride_ = -1.0;
+    bool   forceNull_       = false;
 
-    // 源参数
-    int srcSampleRate_   = 48000;
-    int srcChannels_     = 2;
-    AVSampleFormat srcFmt_ = AV_SAMPLE_FMT_FLT;
-
-    // 音频设备
-    std::unique_ptr<QAudioSink> audioSink_;
-    AudioIO*                    audioIO_ = nullptr;
-
-    // 时钟
-    AudioClock* audioClock_ = nullptr;
-
-    // 均衡器（可选引用，不拥有）
-    Equalizer* equalizer_ = nullptr;
-
-    // 频谱分析器（可选引用，不拥有）
-    SpectrumAnalyzer* spectrumAnalyzer_ = nullptr;
-
-    // 状态
-    std::atomic<bool> initialized_{false};
-    std::atomic<bool> running_{false};
-    std::atomic<int64_t> consumedSamples_{0};
-
-    // PCM 队列代际：每次 clear()（seek/stop）自增。writeFrames 入队受阻时
-    // 靠它区分"暂停（设备暂不消费，继续保帧等待）"与"队列已作废（丢弃在途帧）"
-    std::atomic<uint64_t> queueGeneration_{0};
-
-    // 音量（0~100）与静音
-    std::atomic<int>  volumePercent_{100};
-    std::atomic<bool> muted_{false};
-
-    // 播放速度
+    std::atomic<bool> opened_{false};
+    std::atomic<bool> started_{false};
+    std::atomic<bool> nullSink_{false};
+    std::atomic<bool> paused_{false};
+    std::atomic<bool> eos_{false};
+    std::atomic<bool> closing_{false};
+    std::atomic<bool> haveFloor_{false};
+    std::atomic<double> floorPos_{0.0};
     std::atomic<double> speed_{1.0};
+    std::atomic<int>  volume_{100};
+    std::atomic<bool> muted_{false};
+    std::atomic<int>  underrunCount_{0};
+    std::atomic<bool> pipeErrorLogged_{false};
 
-    // 保护 swrCtx_ 与 swrBuf_（demux 线程 setPlaybackSpeed 与音频解码线程
-    // writeFrame 可能并发访问；|mutex| 加在 writeFrame/flushTail/resetPipeline
-    // 与 setPlaybackSpeed 上，无性能瓶颈——写入频率极低）
-    mutable std::mutex swrMutex_;
-
-    // 静音填充统计
-    std::atomic<int> underrunCount_{0};
+    Equalizer*        equalizer_        = nullptr;
+    SpectrumAnalyzer* spectrumAnalyzer_ = nullptr;
 };
 
 #endif // AUDIO_OUTPUT_H

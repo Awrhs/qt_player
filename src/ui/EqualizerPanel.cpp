@@ -27,6 +27,7 @@ EqualizerPanel::EqualizerPanel(Equalizer* equalizer, QWidget* parent)
         slider->setValue(0);
         slider->setFixedHeight(80);
         slider->setTickPosition(QSlider::NoTicks);
+        slider->setFocusPolicy(Qt::NoFocus);   // 方向键留给主窗口快捷键
         sliders_[i] = slider;
 
         // 频率标签
@@ -49,6 +50,7 @@ EqualizerPanel::EqualizerPanel(Equalizer* equalizer, QWidget* parent)
     // 预设下拉框
     auto* presetLayout = new QVBoxLayout();
     presetCombo_ = new QComboBox(this);
+    presetCombo_->setFocusPolicy(Qt::NoFocus);
     for (const auto& name : Equalizer::presetNames()) {
         presetCombo_->addItem(QString::fromStdString(name));
     }

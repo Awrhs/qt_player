@@ -8,8 +8,7 @@ LOG_TAG("Decoder")
 Decoder::Decoder()  = default;
 Decoder::~Decoder() { close(); }
 
-bool Decoder::open(const AVCodecParameters* codecpar, bool useHW) {
-    std::lock_guard<std::mutex> lock(mtx_);
+bool Decoder::open(const AVCodecParameters* codecpar, AVRational timeBase, bool useHW) {
     close();
     useHW_ = useHW;
 
@@ -19,15 +18,27 @@ bool Decoder::open(const AVCodecParameters* codecpar, bool useHW) {
         return false;
     }
 
-    ctx_ = avcodec_alloc_context3(codec);
-    if (!ctx_) {
-        LOG_E("Failed to allocate AVCodecContext");
-        return false;
-    }
+    auto allocCtx = [&]() -> bool {
+        ctx_ = avcodec_alloc_context3(codec);
+        if (!ctx_) {
+            LOG_E("Failed to allocate AVCodecContext");
+            return false;
+        }
+        int r = avcodec_parameters_to_context(ctx_, codecpar);
+        if (r < 0) {
+            LOG_E("avcodec_parameters_to_context failed: %d", r);
+            return false;
+        }
+        if (timeBase.num > 0 && timeBase.den > 0) ctx_->pkt_timebase = timeBase;
+        if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            // 多线程软解（自动按 CPU 数），1080p H.264 单线程常常跟不上实时
+            ctx_->thread_count = 0;
+            ctx_->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
+        }
+        return true;
+    };
 
-    int ret = avcodec_parameters_to_context(ctx_, codecpar);
-    if (ret < 0) {
-        LOG_E("avcodec_parameters_to_context failed: %d", ret);
+    if (!allocCtx()) {
         close();
         return false;
     }
@@ -42,14 +53,15 @@ bool Decoder::open(const AVCodecParameters* codecpar, bool useHW) {
         } else {
             LOG_W("Hardware decode unavailable, falling back to software");
             useHW_ = false;
-            // 重新分配 context（get_format 设置已还原）
             avcodec_free_context(&ctx_);
-            ctx_ = avcodec_alloc_context3(codec);
-            avcodec_parameters_to_context(ctx_, codecpar);
+            if (!allocCtx()) {
+                close();
+                return false;
+            }
         }
     }
 
-    ret = avcodec_open2(ctx_, codec, nullptr);
+    int ret = avcodec_open2(ctx_, codec, nullptr);
     if (ret < 0) {
         char errBuf[256] = {0};
         av_strerror(ret, errBuf, sizeof(errBuf));
@@ -58,18 +70,16 @@ bool Decoder::open(const AVCodecParameters* codecpar, bool useHW) {
         return false;
     }
 
-    LOG_I("Decoder opened: codec=%s, hw=%d", codec->name, useHW_);
+    LOG_I("Decoder opened: codec=%s, hw=%d, threads=%d", codec->name, useHW_, ctx_->thread_count);
     return true;
 }
 
-int Decoder::sendPacket(AVPacket* pkt) {
-    std::lock_guard<std::mutex> lock(mtx_);
+int Decoder::sendPacket(const AVPacket* pkt) {
     if (!ctx_) return AVERROR(EINVAL);
     return avcodec_send_packet(ctx_, pkt);
 }
 
 int Decoder::receiveFrame(AVFrame* frame) {
-    std::lock_guard<std::mutex> lock(mtx_);
     if (!ctx_) return AVERROR(EINVAL);
     int ret = avcodec_receive_frame(ctx_, frame);
 
@@ -83,11 +93,7 @@ int Decoder::receiveFrame(AVFrame* frame) {
             LOG_E("av_hwframe_transfer_data failed: %d", hwRet);
             return hwRet;
         }
-        // 复制 metadata
-        swFrame->pts = frame->pts;
-        swFrame->pkt_dts = frame->pkt_dts;
-        swFrame->duration = frame->duration;
-
+        av_frame_copy_props(swFrame, frame);   // pts / duration / SAR / 色彩信息等
         av_frame_unref(frame);
         av_frame_move_ref(frame, swFrame);
         av_frame_free(&swFrame);
@@ -97,23 +103,21 @@ int Decoder::receiveFrame(AVFrame* frame) {
 }
 
 void Decoder::flush() {
-    std::lock_guard<std::mutex> lock(mtx_);
     if (ctx_) avcodec_flush_buffers(ctx_);
 }
 
 void Decoder::close() {
-    if (hwDeviceCtx_) {
-        av_buffer_unref(&hwDeviceCtx_);
-    }
     if (ctx_) {
         avcodec_free_context(&ctx_);
+    }
+    if (hwDeviceCtx_) {
+        av_buffer_unref(&hwDeviceCtx_);
     }
     hwPixFmt_ = AV_PIX_FMT_NONE;
     useHW_ = false;
 }
 
 bool Decoder::tryInitHardware(const AVCodec* codec) {
-    // 检查解码器是否支持 DXVA2
     for (int i = 0;; ++i) {
         const AVCodecHWConfig* cfg = avcodec_get_hw_config(codec, i);
         if (!cfg) break;

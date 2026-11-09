@@ -2,6 +2,7 @@
 
 #include <QPainter>
 #include <QResizeEvent>
+#include <QMouseEvent>
 #include <QStyleOption>
 
 VideoWidget::VideoWidget(QWidget* parent)
@@ -10,6 +11,8 @@ VideoWidget::VideoWidget(QWidget* parent)
     setMinimumSize(320, 240);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     setStyleSheet("background-color: black;");
+    setFocusPolicy(Qt::NoFocus);
+    placeholder_ = tr("播放器已就绪\n打开文件或拖入文件开始播放");
 }
 
 void VideoWidget::setFrame(const QImage& image) {
@@ -18,22 +21,26 @@ void VideoWidget::setFrame(const QImage& image) {
         currentFrame_ = image;
         hasFrame_ = true;
     }
-    // 首帧（或分辨率变化）会改变宽高比，重新计算并下发输出尺寸
     updateTargetSize();
-    // 触发异步重绘
     update();
 }
 
 void VideoWidget::clearFrame() {
-    QMutexLocker lock(&frameMtx_);
-    currentFrame_ = {};
-    hasFrame_ = false;
+    {
+        QMutexLocker lock(&frameMtx_);
+        currentFrame_ = {};
+        hasFrame_ = false;
+    }
+    update();
+}
+
+void VideoWidget::setPlaceholderText(const QString& text) {
+    placeholder_ = text;
     update();
 }
 
 QSizeF VideoWidget::logicalSizeLocked() const {
     if (!hasFrame_ || currentFrame_.isNull()) return {};
-    // displayAspect_ 已含 SAR：保持像素高度、按显示比例调整逻辑宽度
     if (displayAspect_ > 0.0) {
         return QSizeF(currentFrame_.height() * displayAspect_,
                       currentFrame_.height());
@@ -53,7 +60,6 @@ void VideoWidget::setDisplayAspect(double aspect) {
         QMutexLocker lock(&frameMtx_);
         displayAspect_ = aspect;
     }
-    // 比例变化改变适配尺寸，立即重新下发
     lastEmittedSize_ = {};
     updateTargetSize();
     update();
@@ -61,6 +67,15 @@ void VideoWidget::setDisplayAspect(double aspect) {
 
 void VideoWidget::resizeEvent(QResizeEvent* /*event*/) {
     updateTargetSize();
+}
+
+void VideoWidget::mouseDoubleClickEvent(QMouseEvent* event) {
+    if (event->button() == Qt::LeftButton) {
+        emit doubleClicked();
+        event->accept();
+        return;
+    }
+    QWidget::mouseDoubleClickEvent(event);
 }
 
 void VideoWidget::updateTargetSize() {
@@ -73,23 +88,19 @@ void VideoWidget::updateTargetSize() {
 
 void VideoWidget::paintEvent(QPaintEvent* /*event*/) {
     QPainter painter(this);
-
-    // 背景
     painter.fillRect(rect(), Qt::black);
 
     QMutexLocker lock(&frameMtx_);
 
     if (!hasFrame_ || currentFrame_.isNull()) {
-        // 空状态：显示提示文字
         painter.setPen(Qt::gray);
         QFont font = painter.font();
         font.setPointSize(14);
         painter.setFont(font);
-        painter.drawText(rect(), Qt::AlignCenter, tr("播放器已就绪\n打开文件开始播放"));
+        painter.drawText(rect(), Qt::AlignCenter, placeholder_);
         return;
     }
 
-    // 按显示宽高比（含 SAR）计算目标矩形（与上报给播放器的输出尺寸一致）
     QSizeF  scaledSize = logicalSizeLocked().scaled(QSizeF(size()),
                                                     Qt::KeepAspectRatio);
     QRectF  targetRect = QRectF(
@@ -98,8 +109,6 @@ void VideoWidget::paintEvent(QPaintEvent* /*event*/) {
         scaledSize.width(), scaledSize.height());
 
     // 正常情况下 currentFrame_ 已由 sws 缩放到目标尺寸，这里是 1:1 拷贝；
-    // 若尺寸暂时不一致（如窗口刚拖动、首帧未及重配），drawImage 按目标矩形
-    // 缩放兜底。默认不开 SmoothPixmapTransform（高帧率下软件平滑缩放会超出
-    // 帧预算）；尺寸一致时该提示无影响。
+    // 尺寸暂时不一致（窗口刚拖动）时 drawImage 按目标矩形缩放兜底。
     painter.drawImage(targetRect, currentFrame_);
 }

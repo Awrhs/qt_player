@@ -32,6 +32,8 @@ public:
     static constexpr int    kOutChannels = 2;
     static constexpr double kMinTempo    = 0.5;
     static constexpr double kMaxTempo    = 2.0;
+    /** @brief 输入时间戳与预期连续位置相差超过该值视为间断，重新锚定媒体时间 */
+    static constexpr double kGapThresholdSec = 0.1;
 
     AudioPipeline();
     ~AudioPipeline();

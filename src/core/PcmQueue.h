@@ -79,11 +79,13 @@ public:
     }
 
     struct PullResult {
-        size_t frames   = 0;     ///< 实际拷贝的帧数
-        double endPos   = 0.0;   ///< 已交付数据末尾的媒体时间
-        double tempo    = 1.0;   ///< 最后一块的倍速
-        double firstPts = -1.0;  ///< 本次首次开始消费的块的 pts（无则 <0）
-        bool   any      = false; ///< 是否拿到了任何数据
+        size_t   frames     = 0;     ///< 实际拷贝的帧数
+        double   endPos     = 0.0;   ///< 已交付数据末尾的媒体时间
+        double   tempo      = 1.0;   ///< 最后一块的倍速
+        double   firstPts   = -1.0;  ///< 本次首次开始消费的块的 pts（无则 <0）
+        double   floorPts   = -1.0;  ///< 本代际（上次 flush 以来）首个被消费块的 pts
+        uint64_t generation = 0;     ///< 本次拉取时的代际（flush 后作废）
+        bool     any        = false; ///< 是否拿到了任何数据
     };
 
     /**
@@ -94,6 +96,7 @@ public:
     PullResult pull(float* out, size_t frames) {
         std::lock_guard<std::mutex> lock(mtx_);
         PullResult r;
+        r.generation = generation_;
         size_t done = 0;
         while (done < frames) {
             if (!hasCur_) {
@@ -104,6 +107,7 @@ public:
                 curOff_ = 0;
                 hasCur_ = true;
                 if (r.firstPts < 0.0) r.firstPts = cur_.pts;
+                if (floorPts_ < 0.0) floorPts_ = cur_.pts;
             }
             size_t curFrames = cur_.frames(channels_);
             size_t avail = curFrames - curOff_;
@@ -123,7 +127,8 @@ public:
                 cur_.data.clear();
             }
         }
-        r.frames = done;
+        r.frames   = done;
+        r.floorPts = floorPts_;
         if (done > 0) notFull_.notify_all();
         return r;
     }
@@ -137,6 +142,7 @@ public:
         hasCur_ = false;
         curOff_ = 0;
         cur_.data.clear();
+        floorPts_ = -1.0;
         notFull_.notify_all();
     }
 
@@ -162,6 +168,7 @@ private:
     size_t   curOff_      = 0;
     bool     hasCur_      = false;
     size_t   totalFrames_ = 0;
+    double   floorPts_    = -1.0;
     uint64_t generation_  = 0;
     int      channels_;
     int      rate_;

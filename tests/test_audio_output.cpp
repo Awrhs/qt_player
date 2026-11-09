@@ -82,9 +82,9 @@ int main(int argc, char* argv[]) {
     TEST("clock frozen while starving", near(clock.now(), frozen, 0.002));
     TEST("clock not running while starving", !clock.isRunning());
 
-    // 3. seek：新代际 + pre-roll 裁剪；旧代际帧被丢弃
+    // 3. seek：新代际 + pre-roll 裁剪；旧代际帧被丢弃；flush 自身把时钟置到目标点
     out.flush(2, 0.5);
-    clock.set(0.5);
+    TEST("flush positions clock at target", near(clock.now(), 0.5, 1e-9) && clock.isWaiting());
     TEST("flush empties queue", out.queuedFrames() == 0 && !out.isDrained());
     pushFrames(out, 1, 3, 0);
     TEST("stale-serial frames dropped", out.queuedFrames() == 0);
@@ -134,6 +134,22 @@ int main(int argc, char* argv[]) {
     TEST("eos without data un-waits clock", !clock.isWaiting());
     QThread::msleep(30);
     TEST("clock free-runs", clock.now() > 4.02);
+
+    // 7b. 最后一次拉取只拿到部分数据（时钟停表、非 waiting）后到达 EOF：时钟须恢复走时
+    out.flush(8, -1.0);
+    clock.set(5.0);
+    pushFrames(out, 8, 3, 240000);            // atempo 需约 2000 样本后才有输出
+    out.pullAudio(buf.data(), 4800);          // 只拿到部分输出，其余补静音 → 停表
+    TEST("partial pull froze clock", !clock.isRunning() && !clock.isWaiting());
+    out.pushEndOfStream(8);
+    for (int i = 0; i < 5 && !out.isDrained(); ++i) out.pullAudio(buf.data(), 4800);
+    out.pullAudio(buf.data(), 4800);
+    TEST("eos un-freezes clock", clock.isRunning());
+    {
+        double before = clock.now();
+        QThread::msleep(30);
+        TEST("clock runs to the end after eos", clock.now() > before + 0.02);
+    }
 
     // 8. 生产者阻塞在满队列上时，requestStop 能唤醒它
     out.flush(7, -1.0);

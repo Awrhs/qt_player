@@ -75,9 +75,12 @@ public:
 private:
     static int interruptCallback(void* opaque);
     void findStreamIndices();
+    static bool looksLikeNetworkUrl(const std::string& url);
 
     AVFormatContext* fmtCtx_ = nullptr;
     const std::atomic<bool>* abort_ = nullptr;
+    // open 阶段的超时截止（steady_clock 纳秒，0 表示无限制），打断无响应的网络连接
+    std::atomic<long long> openDeadlineNs_{0};
     int audioIndex_ = -1;
     int videoIndex_ = -1;
 };

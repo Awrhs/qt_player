@@ -352,6 +352,7 @@ void MainWindow::setFullScreen(bool on) {
     if (on == fullScreen_) return;
     fullScreen_ = on;
     if (on) {
+        stateBeforeFullScreen_ = windowState() & ~Qt::WindowFullScreen;
         menuBar()->hide();
         statusBar()->hide();
         controls_->hide();
@@ -359,7 +360,9 @@ void MainWindow::setFullScreen(bool on) {
         spectrumWidget_->hide();
         showFullScreen();
     } else {
-        showNormal();
+        // 恢复全屏前的窗口状态（最大化等），而不是一律 showNormal
+        if (stateBeforeFullScreen_ & Qt::WindowMaximized) showMaximized();
+        else showNormal();
         menuBar()->show();
         statusBar()->show();
         controls_->show();
@@ -394,7 +397,7 @@ void MainWindow::setupMenuBar() {
     addShortcutAction(fileMenu, tr("打开 URL..."), {QKeySequence(Qt::CTRL | Qt::Key_U)},
                       [this] { openUrl(); });
     fileMenu->addSeparator();
-    addShortcutAction(fileMenu, tr("退出"), {QKeySequence::Quit},
+    addShortcutAction(fileMenu, tr("退出"), {QKeySequence(Qt::CTRL | Qt::Key_Q)},
                       [] { qApp->closeAllWindows(); });
 
     // ── 播放 ──

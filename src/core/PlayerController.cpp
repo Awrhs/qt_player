@@ -21,6 +21,7 @@ constexpr int64_t kQueuedBytesMax       = 16LL * 1024 * 1024;
 constexpr double  kEofSettleSec         = 0.20;  // 位置到达末尾后的稳态等待
 constexpr double  kEofMaxWaitSec        = 1.50;  // 数据排空后最多等待位置到末尾的时间
 constexpr double  kAudioStartTimeoutSec = 2.0;
+constexpr double  kClockStallTimeoutSec = 3.0;
 constexpr double  kSpeedMin             = 0.5;
 constexpr double  kSpeedMax             = 2.0;
 
@@ -211,11 +212,12 @@ void PlayerController::open(const QString& path, bool useHardwareDecode) {
     seekPendingFlag_ = false;
     audioPackets_.flush(1, -1.0);
     videoPackets_.flush(1, -1.0);
-    if (audioOutput_) audioOutput_->flush(1, -1.0);
 
     clock_.resume();
     clock_.setSpeed(speed_.load());
     clock_.set(startTime_);
+    if (audioOutput_) audioOutput_->flush(1, startTime_);
+    clockStallSince_ = {};
 
     state_ = PlayState::Playing;
     startThreads();
@@ -248,16 +250,21 @@ void PlayerController::play() {
     ended_   = false;
     stepped_ = false;
     showFrameWhenPaused_ = false;
+    // 先置 Playing 再请求 seek：processSeek 不会把它当作暂停态 seek
+    state_ = PlayState::Playing;
 
-    resumePlayback();
-
-    if (restart) {
-        LOG_I("Play pressed at end, restarting from beginning");
-        requestSeek(startTime_);
-    } else if (realign) {
-        // 逐帧后画面已前进而音频仍停在暂停点：精确 seek 到画面位置让音频对齐
-        requestSeek(lastFrameStreamPts_);
+    if (restart || realign) {
+        // 暂停点残留的 PCM 不该在 seek 生效前被播出
+        if (audioOutput_) audioOutput_->dropQueuedPcm();
+        if (restart) {
+            LOG_I("Play pressed at end, restarting from beginning");
+            requestSeek(startTime_);
+        } else {
+            // 逐帧后画面已前进而音频仍停在暂停点：精确 seek 到画面位置让音频对齐
+            requestSeek(lastFrameStreamPts_);
+        }
     }
+    resumePlayback();
 }
 
 void PlayerController::resumePlayback() {
@@ -283,6 +290,8 @@ void PlayerController::resumePlayback() {
 void PlayerController::pause() {
     if (state_.load() != PlayState::Playing) return;
     state_ = PlayState::Paused;
+    showFrameWhenPaused_.store(false);
+    clockStallSince_ = {};
     clock_.pause();
     if (audioOutput_) audioOutput_->pause();
     emit stateChanged(PlayState::Paused);
@@ -369,9 +378,13 @@ void PlayerController::stepForward() {
             releaseFrame(pendingFrame_);
         }
     }
-    if (!vf.frame && !popFrame(vf, 1000)) {
-        LOG_W("stepForward: no frame available");
-        return;
+    if (!vf.frame) {
+        const bool drained = demuxEof_.load() && videoEosSerial_.load() == serial_.load() &&
+                             frameQueue_.empty();
+        if (drained || !popFrame(vf, 300)) {
+            LOG_W("stepForward: no frame available");
+            return;
+        }
     }
     displayFrame(vf);
     clock_.set(lastFrameStreamPts_);
@@ -457,12 +470,13 @@ void PlayerController::processSeek(double target) {
     }
 
     const uint64_t s = serial_.fetch_add(1) + 1;
-    // 先切换音频输出代际，再清包队列：避免新代际首帧被旧代际检查误丢
+    // 先切换音频输出代际，再清包队列：避免新代际首帧被旧代际检查误丢。
+    // 有音频时时钟由 AudioOutput::flush 在其时钟锁内置位，与设备回调的锚定串行化
     if (audioOutput_) audioOutput_->flush(s, target);
+    else clock_.set(target);
     audioPackets_.flush(s, target);
     videoPackets_.flush(s, target);
     clearFrameQueue();
-    clock_.set(target);
     demuxEof_.store(false);
     if (state_.load() == PlayState::Paused) showFrameWhenPaused_.store(true);
     seekPendingFlag_.store(false);
@@ -618,6 +632,27 @@ void PlayerController::onRenderTick() {
     // 视频-only：首帧（或 seek 后首帧）锚定时钟
     if (clock_.isWaiting() && !audioDrivesClock()) {
         clock_.update(frameTime(vf.frame), speed_.load());
+        if (vf.serial != serial_.load()) {
+            // 锚定瞬间发生了 seek：撤销，时钟回到新目标点等待
+            clock_.set(videoPackets_.seekTarget());
+            releaseFrame(vf);
+            scheduleRender(5);
+            return;
+        }
+    }
+
+    // 看门狗：音频应驱动时钟却长时间不走（解码器无输出、滤镜失败、设备异常），
+    // 改为按墙上时钟自走，视频不能因此永远停住
+    if (audioDrivesClock() && !clock_.isRunning() && !clock_.isPaused()) {
+        if (clockStallSince_ == SteadyClock::time_point{}) {
+            clockStallSince_ = now;
+        } else if (secondsSince(clockStallSince_) > kClockStallTimeoutSec) {
+            LOG_W("Audio clock stalled for %.1fs, running on wall clock", kClockStallTimeoutSec);
+            clock_.update(clock_.isWaiting() ? frameTime(vf.frame) : clock_.now(), speed_.load());
+            clockStallSince_ = {};
+        }
+    } else {
+        clockStallSince_ = {};
     }
 
     double delay = frameTime(vf.frame) - clock_.now();
@@ -655,7 +690,7 @@ void PlayerController::onRenderTick() {
 
 bool PlayerController::checkEndOfStream() {
     if (ended_) return true;
-    if (!demuxEof_.load()) {
+    if (!demuxEof_.load() || seekPendingFlag_.load()) {
         eofSettling_  = false;
         drainedSince_ = {};
         return false;

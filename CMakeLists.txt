@@ -24,12 +24,12 @@ find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Multimedia Network)
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND AND NOT FFMPEG_DIR)
     pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-        libavformat>=59
-        libavcodec>=59
-        libavutil>=57
-        libswresample>=4
-        libswscale>=6
-        libavfilter>=8)
+        libavformat>=59.27
+        libavcodec>=59.37
+        libavutil>=57.28
+        libswresample>=4.7
+        libswscale>=6.7
+        libavfilter>=8.44)
     set(FFMPEG_TARGET PkgConfig::FFMPEG)
 else()
     if(NOT FFMPEG_DIR)

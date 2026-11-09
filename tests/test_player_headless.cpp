@@ -206,17 +206,20 @@ int main(int argc, char* argv[]) {
         TEST("play: position advances after resume", player.position() > p2 + 0.3);
     }
 
-    // 倍速 2x
+    // 倍速 2x（先回到片头附近，保证 1 秒测量窗口不会撞到文件末尾）
+    probe.lastFrame = -1.0;
+    player.seek(0.5);
+    TEST("speed: repositioned for measurement", waitFor([&] { return probe.lastFrame >= 0.5; }, 8000));
     player.setSpeed(2.0);
     TEST("speed: reported", std::fabs(player.speed() - 2.0) < 1e-9);
-    pump(400);
+    pump(500);   // 队列中旧倍速的 PCM（≈250ms）排空
     {
         int framesBefore = probe.frames;
         double p3 = player.position();
         pump(1000);
         double d = player.position() - p3;
         std::cout << "  2x: position delta over 1s = " << d << std::endl;
-        TEST("speed: 2x advances ~2s per second", d > 1.3 && d < 2.8);
+        TEST("speed: 2x advances ~2s per second", d > 1.6 && d < 2.4);
         TEST("speed: frames still displayed at 2x", probe.frames > framesBefore + 5);
     }
 

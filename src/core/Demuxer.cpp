@@ -2,6 +2,7 @@
 #include "../utils/Log.h"
 
 #include <algorithm>
+#include <chrono>
 
 LOG_TAG("Demuxer")
 
@@ -10,7 +11,24 @@ Demuxer::~Demuxer() { close(); }
 
 int Demuxer::interruptCallback(void* opaque) {
     auto* self = static_cast<Demuxer*>(opaque);
-    return (self && self->abort_ && self->abort_->load()) ? 1 : 0;
+    if (!self) return 0;
+    if (self->abort_ && self->abort_->load()) return 1;
+    const long long deadline = self->openDeadlineNs_.load();
+    if (deadline > 0) {
+        const long long now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now > deadline) return 1;
+    }
+    return 0;
+}
+
+bool Demuxer::looksLikeNetworkUrl(const std::string& url) {
+    static const char* kPrefixes[] = {"http://", "https://", "rtsp://", "rtmp://", "rtmps://",
+                                      "udp://", "tcp://", "srt://", "rtp://", "mms://", "ftp://"};
+    for (const char* p : kPrefixes) {
+        if (url.rfind(p, 0) == 0) return true;
+    }
+    return false;
 }
 
 bool Demuxer::open(const std::string& url) {
@@ -25,6 +43,15 @@ bool Demuxer::open(const std::string& url) {
     // 网络流优化：缩短探测时间
     av_dict_set(&opts, "analyzeduration", "2000000", 0);  // 2秒探测窗口
     av_dict_set(&opts, "probesize",        "5000000", 0);  // 5MB 探测上限
+    const bool network = looksLikeNetworkUrl(url);
+    if (network) {
+        // 单次读写超时 10s（http/tcp 等协议）；连接阶段整体 20s 由中断回调兜底
+        av_dict_set(&opts, "rw_timeout", "10000000", 0);
+        openDeadlineNs_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            (std::chrono::steady_clock::now() + std::chrono::seconds(20)).time_since_epoch()).count());
+    } else {
+        openDeadlineNs_.store(0);
+    }
 
     int ret = avformat_open_input(&fmtCtx_, url.c_str(), nullptr, &opts);
     av_dict_free(&opts);
@@ -33,6 +60,7 @@ bool Demuxer::open(const std::string& url) {
         av_strerror(ret, errBuf, sizeof(errBuf));
         LOG_E("avformat_open_input failed for '%s': %s", url.c_str(), errBuf);
         fmtCtx_ = nullptr;   // avformat_open_input 失败时已释放 context
+        openDeadlineNs_.store(0);
         return false;
     }
 
@@ -42,6 +70,7 @@ bool Demuxer::open(const std::string& url) {
         // 非致命：仍可尝试读取
     }
 
+    openDeadlineNs_.store(0);   // 打开完成，之后只受 abort 标志控制
     findStreamIndices();
 
     LOG_I("Opened '%s': %u streams, start=%.3fs, duration=%.2fs, video_idx=%d, audio_idx=%d",

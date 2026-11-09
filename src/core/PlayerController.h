@@ -235,6 +235,7 @@ private:
     bool       eofSettling_        = false;
     std::chrono::steady_clock::time_point eofSettleTp_{};
     std::chrono::steady_clock::time_point drainedSince_{};
+    std::chrono::steady_clock::time_point clockStallSince_{};
     uint64_t   loopSeekSerial_     = 0;
     double     currentAspect_      = -1.0;
     int        statDropped_        = 0;

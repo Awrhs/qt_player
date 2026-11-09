@@ -71,8 +71,14 @@ public:
     void pushEndOfStream(uint64_t serial);
 
     // ── 控制 ──
-    /** @brief seek：切换代际、丢弃全部缓冲、设置 pre-roll 丢弃阈值（流时间，秒） */
-    void flush(uint64_t serial, double discardUntilSec);
+    /**
+     * @brief seek：切换代际、丢弃全部缓冲、设置 pre-roll 丢弃阈值并把主时钟置于目标点
+     * @param targetSec 目标位置（流时间，秒）；<0 表示不过滤、不动时钟
+     */
+    void flush(uint64_t serial, double targetSec);
+
+    /** @brief 仅丢弃已排队的 PCM（恢复播放前将要 seek 时避免播出暂停点的旧声音） */
+    void dropQueuedPcm();
     void setSpeed(double speed);
     void setVolume(int percent);
     void setMuted(bool muted);
@@ -111,9 +117,19 @@ signals:
     void underrun();
 
 private:
+    /**
+     * @brief 供 QAudioSink 拉取的 QIODevice
+     *
+     * 必须表现为“永远有数据的顺序设备”：部分后端（WASAPI、Qt ≥ 6.8 的共享流层）
+     * 先查询 bytesAvailable()/atEnd()，为 0 就停止拉取且不再重试；缺数据时由
+     * pullAudio 补静音是既定契约。
+     */
     class AudioIO : public QIODevice {
     public:
         explicit AudioIO(AudioOutput* output);
+        bool   isSequential() const override { return true; }
+        qint64 bytesAvailable() const override;
+        bool   atEnd() const override { return false; }
     protected:
         qint64 readData(char* data, qint64 maxSize) override;
         qint64 writeData(const char* data, qint64 maxSize) override;
@@ -125,11 +141,15 @@ private:
     void applyVolume();
     void nullTick();
     void queueChunks(std::vector<PcmChunk>& chunks, uint64_t gen);
+    void switchToNullSink(const char* reason);
 
     mutable std::mutex pipeMtx_;
     AudioPipeline  pipeline_;
     uint64_t       serial_ = 0;
     PcmQueue       queue_;
+    // 串行化“设备回调锚定时钟”与“seek 置位时钟”：flush 在该锁内清队列并 set，
+    // pullAudio 在该锁内比对代际后才 update，旧代际的拉取结果不会覆盖新位置
+    std::mutex     clockMtx_;
     MediaClock*    clock_ = nullptr;
     const std::atomic<bool>* running_ = nullptr;
 
@@ -151,8 +171,6 @@ private:
     std::atomic<bool> paused_{false};
     std::atomic<bool> eos_{false};
     std::atomic<bool> closing_{false};
-    std::atomic<bool> haveFloor_{false};
-    std::atomic<double> floorPos_{0.0};
     std::atomic<double> speed_{1.0};
     std::atomic<int>  volume_{100};
     std::atomic<bool> muted_{false};

@@ -40,6 +40,8 @@ void testPushPullAccounting() {
     auto r = q.pull(buf.data(), 30);
     TEST("pull 30 frames", r.frames == 30 && r.any);
     TEST("first pts of started chunk", near(r.firstPts, 1.0));
+    TEST("floor is first chunk of generation", near(r.floorPts, 1.0));
+    TEST("generation reported", r.generation == gen);
     TEST("end position after 30 frames", near(r.endPos, 1.0 + 30.0 / 1000.0));
     TEST("data copied", buf[0] == 0.5f && buf[59] == 0.5f);
     TEST("not empty", !q.empty());
@@ -47,6 +49,7 @@ void testPushPullAccounting() {
     r = q.pull(buf.data(), 40);   // 20 from chunk1 + 20 from chunk2
     TEST("pull across chunks", r.frames == 40);
     TEST("firstPts is the newly started chunk", near(r.firstPts, 1.05));
+    TEST("floor stays at generation start", near(r.floorPts, 1.0));
     TEST("end position in second chunk", near(r.endPos, 1.05 + 20.0 / 1000.0));
 
     // 消费后空间释放，之前被拒的块现在可以入队
@@ -79,6 +82,17 @@ void testFlushGeneration() {
     q.flush();
     TEST("flush drops queued and partial", q.empty());
     TEST("generation incremented", q.generation() == gen + 1);
+    {
+        auto r = q.pull(buf.data(), 5);
+        TEST("floor reset by flush", r.floorPts < 0.0 && !r.any);
+        TEST("pull reports new generation", r.generation == gen + 1);
+    }
+    q.push(makeChunk(10, 7.5, 1.0), q.generation(), std::chrono::milliseconds(10));
+    {
+        auto r = q.pull(buf.data(), 5);
+        TEST("floor re-established from first new chunk", near(r.floorPts, 7.5));
+    }
+    q.flush();
     TEST("stale generation push rejected", !q.push(makeChunk(10, 0.0, 1.0), gen, std::chrono::milliseconds(10)));
     TEST("fresh generation push accepted", q.push(makeChunk(10, 0.0, 1.0), q.generation(), std::chrono::milliseconds(10)));
 }

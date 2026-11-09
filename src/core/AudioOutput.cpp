@@ -18,8 +18,9 @@ namespace AudioNs = QAudio;
 #endif
 
 namespace {
-constexpr double kQueueSeconds = 0.25;   // PCM 队列深度（变速/seek 生效延迟上限）
-constexpr int    kNullTickMs   = 20;
+constexpr double kQueueSeconds        = 0.25;   // PCM 队列深度（变速/seek 生效延迟上限）
+constexpr double kDeviceBufferSeconds = 0.10;   // 向设备申请的缓冲时长
+constexpr int    kNullTickMs          = 20;
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -40,6 +41,15 @@ qint64 AudioOutput::AudioIO::readData(char* data, qint64 maxSize) {
 
 qint64 AudioOutput::AudioIO::writeData(const char*, qint64) {
     return 0;
+}
+
+qint64 AudioOutput::AudioIO::bytesAvailable() const {
+    if (!output_) return 0;
+    // 已排队 PCM + 一秒静音余量：后端按自身缓冲空闲量决定实际读多少
+    const qint64 frameBytes = static_cast<qint64>(output_->channels()) * sizeof(float);
+    const qint64 queued = static_cast<qint64>(output_->queue_.queuedFrames()) * frameBytes;
+    return queued + static_cast<qint64>(output_->sampleRate()) * frameBytes +
+           QIODevice::bytesAvailable();
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -105,7 +115,6 @@ bool AudioOutput::open(int srcSampleRate, const AVChannelLayout* srcLayout,
     queue_.flush();
 
     eos_             = false;
-    haveFloor_       = false;
     started_         = false;
     nullSink_        = false;
     paused_          = false;
@@ -131,13 +140,34 @@ bool AudioOutput::start() {
             sink_ = std::make_unique<QAudioSink>(dev, format_, this);
             io_   = new AudioIO(this);
             io_->open(QIODevice::ReadOnly | QIODevice::Unbuffered);
+            const double bytesPerSec = static_cast<double>(outRate_) * channels() * sizeof(float);
+            // 显式申请 ~100ms 设备缓冲：不指定时 PulseAudio 可能给到 2s，
+            // 既放大音画误差，也让 seek 后听到大段旧位置声音
+            sink_->setBufferSize(static_cast<qsizetype>(bytesPerSec * kDeviceBufferSeconds));
             sink_->start(io_);
             if (sink_->error() == AudioNs::NoError && sink_->state() != AudioNs::StoppedState) {
                 ok = true;
-                const double bytesPerSec = static_cast<double>(outRate_) * channels() * sizeof(float);
                 latencySec_ = bytesPerSec > 0 ? sink_->bufferSize() / bytesPerSec : 0.0;
-                latencySec_ = std::clamp(latencySec_, 0.0, 0.5);
+                if (latencySec_ > 1.0) {
+                    LOG_W("audio device buffer is unusually large (%.2f s)", latencySec_);
+                    latencySec_ = 1.0;
+                }
+                // PCM 队列至少容纳两倍设备缓冲，设备首次填充不会把队列抽空补静音
+                queue_.setCapacityFrames(static_cast<size_t>(
+                    outRate_ * std::max(kQueueSeconds, 2.0 * latencySec_)));
                 applyVolume();
+                // 运行中设备失效（拔出、被独占）：退化为空设备，视频不停
+                connect(sink_.get(), &QAudioSink::stateChanged, this, [this](AudioNs::State s) {
+                    if (s == AudioNs::StoppedState && sink_ && sink_->error() != AudioNs::NoError &&
+                        started_.load() && !closing_.load()) {
+                        QTimer::singleShot(0, this, [this] {
+                            if (sink_ && sink_->state() == AudioNs::StoppedState &&
+                                sink_->error() != AudioNs::NoError && !closing_.load()) {
+                                switchToNullSink("audio device stopped with error");
+                            }
+                        });
+                    }
+                });
                 LOG_I("audio device started: bufferSize=%lld bytes (~%.0f ms latency)",
                       static_cast<long long>(sink_->bufferSize()), latencySec_ * 1000.0);
             } else {
@@ -164,6 +194,23 @@ bool AudioOutput::start() {
     started_ = true;
     paused_  = false;
     return true;
+}
+
+void AudioOutput::switchToNullSink(const char* reason) {
+    LOG_W("%s: switching to null audio sink", reason);
+    if (sink_) {
+        sink_->stop();
+        sink_.reset();
+    }
+    if (io_) {
+        io_->close();
+        delete io_;
+        io_ = nullptr;
+    }
+    latencySec_ = latencyOverride_ >= 0.0 ? latencyOverride_ : 0.0;
+    nullSink_   = true;
+    nullLast_   = std::chrono::steady_clock::now();
+    if (!paused_.load()) nullTimer_->start();
 }
 
 void AudioOutput::pause() {
@@ -250,9 +297,11 @@ void AudioOutput::pushEndOfStream(uint64_t serial) {
     if (queue_.generation() != gen) return;   // 期间发生了 seek
     eos_ = true;
 
-    // 本代际没有任何音频可交付（如 seek 到音频流结束之后）：时钟不能永远 waiting，
-    // 从当前位置开始按墙上时钟自走，让剩余视频继续播放
-    if (clock_ && clock_->isWaiting() && queue_.empty()) {
+    // 本代际没有任何音频可交付（如 seek 到音频流结束之后），或最后一次拉取只拿到
+    // 部分数据后时钟被停表：时钟不能永远停住，从当前位置按墙上时钟自走，
+    // 让剩余视频继续播放、位置到达末尾
+    std::lock_guard<std::mutex> lock(clockMtx_);
+    if (clock_ && queue_.empty() && !clock_->isRunning() && !clock_->isPaused()) {
         clock_->update(clock_->now(), speed_.load());
     }
 }
@@ -273,15 +322,21 @@ void AudioOutput::queueChunks(std::vector<PcmChunk>& chunks, uint64_t gen) {
 
 // ── 控制 ──────────────────────────────────────────────────────────────────
 
-void AudioOutput::flush(uint64_t serial, double discardUntilSec) {
+void AudioOutput::flush(uint64_t serial, double targetSec) {
     {
         std::lock_guard<std::mutex> lock(pipeMtx_);
         serial_ = serial;
-        pipeline_.reset(discardUntilSec);
+        pipeline_.reset(targetSec);
         eos_ = false;
     }
+    std::lock_guard<std::mutex> lock(clockMtx_);
     queue_.flush();
-    haveFloor_ = false;
+    if (clock_ && targetSec >= 0.0) clock_->set(targetSec);
+}
+
+void AudioOutput::dropQueuedPcm() {
+    std::lock_guard<std::mutex> lock(clockMtx_);
+    queue_.flush();
 }
 
 void AudioOutput::setSpeed(double speed) {
@@ -325,26 +380,30 @@ size_t AudioOutput::pullAudio(float* out, size_t frames) {
         std::memset(out + r.frames * ch, 0, (frames - r.frames) * ch * sizeof(float));
     }
 
-    if (r.any) {
-        if (!haveFloor_.load() && r.firstPts >= 0.0) {
-            floorPos_.store(r.firstPts);
-            haveFloor_.store(true);
-        }
-        // 时钟 = 已交付数据末尾 − 设备缓冲延迟（折算为媒体时间），且不早于本段起点
-        double pos = r.endPos - latencySec_ * r.tempo;
-        if (haveFloor_.load()) pos = std::max(pos, floorPos_.load());
-        if (clock_) {
-            clock_->update(pos, r.tempo);
-            // 本次只拿到部分数据、其余补了静音：时钟停在真实数据末尾，
-            // 静音填充期间不走时（下一块数据到达即恢复）
-            if (r.frames < frames && !eos_.load()) clock_->freeze();
-        }
-    } else if (clock_) {
-        if (eos_.load()) {
-            // 尾音播完后继续走时，让位置到达末尾 / 更长的视频继续播放
-            if (clock_->isWaiting()) clock_->update(clock_->now(), speed_.load());
-        } else {
-            clock_->freeze();   // 数据饥饿：停表，避免时钟跑到数据前面
+    {
+        std::lock_guard<std::mutex> lock(clockMtx_);
+        // 拉取期间发生了 flush：这批数据属于旧位置，时钟已由 flush 置到新目标
+        if (r.generation != queue_.generation()) return frames;
+
+        if (r.any) {
+            // 时钟 = 已交付数据末尾 − 设备缓冲延迟（折算为媒体时间），且不早于本段起点
+            double pos = r.endPos - latencySec_ * r.tempo;
+            if (r.floorPts >= 0.0) pos = std::max(pos, r.floorPts);
+            if (clock_) {
+                clock_->update(pos, r.tempo);
+                // 本次只拿到部分数据、其余补了静音：时钟停在真实数据末尾，
+                // 静音填充期间不走时（下一块数据到达即恢复）
+                if (r.frames < frames && !eos_.load()) clock_->freeze();
+            }
+        } else if (clock_) {
+            if (eos_.load()) {
+                // 尾音播完后继续走时，让位置到达末尾 / 更长的视频继续播放
+                if (!clock_->isRunning() && !clock_->isPaused()) {
+                    clock_->update(clock_->now(), speed_.load());
+                }
+            } else {
+                clock_->freeze();   // 数据饥饿：停表，避免时钟跑到数据前面
+            }
         }
     }
 

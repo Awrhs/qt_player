@@ -207,6 +207,29 @@ void testInputChangeRebuild() {
     TEST("rebuild keeps chunks contiguous", contiguous(out, 48000));
 }
 
+void testGapReanchors() {
+    AudioPipeline p;
+    p.configure(48000, AVRational{1, 48000});
+    p.reset(-1.0);
+    std::vector<PcmChunk> out;
+    feedSine(p, out, 10, 1024, 48000, AV_SAMPLE_FMT_FLTP, 2, 0);   // 0 ~ 0.213s
+    // 时间戳跳到 2.0s（TS 断流 / 丢包）
+    for (int i = 0; i < 5; ++i) {
+        AVFrame* f = makeFrame(1024, 48000, AV_SAMPLE_FMT_FLTP, 2, 96000 + i * 1024, i * 1024);
+        TEST("process after gap", p.process(f, out));
+        av_frame_free(&f);
+    }
+    p.flush(out);
+    TEST("gap: media position re-anchored to new timestamps",
+         std::fabs(p.mediaPosition() - (2.0 + 5 * 1024.0 / 48000.0)) < 0.08);
+    bool sawJump = false;
+    for (size_t i = 1; i < out.size(); ++i) {
+        if (out[i].pts > 1.9 && out[i-1].pts < 0.5) sawJump = true;
+    }
+    TEST("gap: chunk pts jump to the new position", sawJump);
+    TEST("gap: last chunk near new position", !out.empty() && out.back().pts > 1.9);
+}
+
 void testResetDropsState() {
     AudioPipeline p;
     p.configure(48000, AVRational{1, 48000});
@@ -233,6 +256,7 @@ int main() {
     testTempoChangeMidStream();
     testNoPts();
     testInputChangeRebuild();
+    testGapReanchors();
     testResetDropsState();
 
     std::cout << "AudioPipeline tests: " << testsPassed << " passed, "

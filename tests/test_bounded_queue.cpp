@@ -31,7 +31,7 @@ void testBasicOperations() {
     q.push(2, std::chrono::milliseconds(100));
     TEST("Size is 2", q.size() == 2);
 
-    int val;
+    int val = 0;
     TEST("Pop returns true", q.pop(val, std::chrono::milliseconds(100)));
     TEST("First value is 1", val == 1);
     TEST("Size is 1", q.size() == 1);
@@ -49,7 +49,7 @@ void testTimeout() {
     bool ok = q.push(2, std::chrono::milliseconds(100));
     TEST("Push on full queue times out", !ok);
 
-    int val;
+    int val = 0;
     q.pop(val, std::chrono::milliseconds(100));
     TEST("Pop works after timeout", val == 1);
 
@@ -83,7 +83,7 @@ void testMultiThread() {
     std::thread consumer([&]() {
         int count = 0;
         while (count < NUM_ITEMS) {
-            int val;
+            int val = 0;
             if (q.pop(val, std::chrono::milliseconds(100))) {
                 received.push_back(val);
                 count++;

@@ -9,6 +9,7 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstddef>
 
@@ -95,6 +96,15 @@ bool AudioPipeline::process(const AVFrame* frame, std::vector<PcmChunk>& out) {
             skip = std::clamp(skip, 0, frame->nb_samples - 1);
         }
         discardUntil_ = -1.0;
+    }
+    // 时间戳间断（TS 断流、丢包、解码错误导致的帧丢失）：排空旧图尾部并重新锚定，
+    // 否则按输出样本累加的媒体时间会与真实时间戳永久错位
+    if (havePos_ && graph_ && !graphEof_ && pts != AV_NOPTS_VALUE &&
+        std::fabs(ptsSec - lastInEnd_) > kGapThresholdSec) {
+        LOG_I("audio timestamp discontinuity: expected %.3f got %.3f, re-anchoring",
+              lastInEnd_, ptsSec);
+        flush(out);
+        havePos_ = false;
     }
     lastInEnd_ = ptsSec + frameDur;
 
